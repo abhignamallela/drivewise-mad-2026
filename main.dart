@@ -1,27 +1,15 @@
 import 'package:flutter/material.dart';
-import 'package:firebase_core/firebase_core.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:sensors_plus/sensors_plus.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:haptic_feedback/haptic_feedback.dart';
 import 'package:http/http.dart' as http;
+import 'package:aad_oauth/aad_oauth.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(
-    options: const FirebaseOptions(
-      apiKey: "AIzaSyC7IrrCvkc7wzg2wZIMjQKTxNgSEqi4uF4",
-      authDomain: "drivewise-mad-2026.firebaseapp.com",
-      projectId: "drivewise-mad-2026",
-      storageBucket: "drivewise-mad-2026.firebasestorage.app",
-      messagingSenderId: "353020906026",
-      appId: "1:353020906026:web:485f0656a53b6082e05153",
-    ),
-  );
+void main() {
   runApp(const DriveWiseApp());
 }
 
@@ -39,62 +27,74 @@ class _DriveWiseAppState extends State<DriveWiseApp> {
   StreamSubscription<Position>? _positionStream;
   StreamSubscription<AccelerometerEvent>? _accelerometerStream;
   FlutterTts? _tts;
-  double _speedLimit = 25.0; // Default, will fetch real
+  double _speedLimit = 25.0;
+
+  // Azure Config (replace with yours)
+  final String _tenantId = 'YOUR_TENANT_ID';  // From AD B2C
+  final String _clientId = 'YOUR_CLIENT_ID';  // From App Registration
+  final String _cosmosEndpoint = 'https://YOUR_COSMOS_ACCOUNT.documents.azure.com:443/';
+  final String _cosmosKey = 'YOUR_PRIMARY_KEY';  // From Keys tab
+  final AadOAuth _oauth = AadOAuth(AzureADAuthConfig(
+    tenant: 'YOUR_TENANT_ID',
+    clientId: 'YOUR_CLIENT_ID',
+    scope: 'openid profile offline_access',
+    redirectUri: 'msauth.com.isu.drivewise://auth',  // Adjust for your app
+  ));
 
   @override void initState() {
     super.initState();
     _tts = FlutterTts();
+    _initAzureAuth();  // Login on start (anonymous/demo)
     _checkPermissionAndStart();
   }
 
-  Future<void> _checkPermissionAndStart() async {
-    // Location permission
-    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      _speak("Please enable location services");
-      return;
+  Future<void> _initAzureAuth() async {
+    try {
+      final result = await _oauth.logIn();  // Triggers AD B2C flow (demo: anonymous)
+      if (result.isSucceeded) {
+        print('Azure Auth Success: ${result.accessToken}');
+        // Use token for Cosmos calls
+      }
+    } catch (e) {
+      print('Auth Error: $e');  // Fallback to demo mode
     }
+  }
 
+  Future<void> _checkPermissionAndStart() async {
+    // Same as before (location/motion)
+    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) return;
     LocationPermission permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
       if (permission == LocationPermission.denied) return;
     }
 
-    // Start streams
     _positionStream = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 10,
-      ),
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 10),
     ).listen((Position position) {
       setState(() {
         _currentPosition = position;
-        _currentSpeed = position.speed * 2.23694; // m/s to mph
+        _currentSpeed = position.speed * 2.23694;  // m/s to mph
       });
-
       _fetchSpeedLimit(position.latitude, position.longitude);
       _checkTripState();
       if (_isDriving) _updateScore();
     });
 
     _accelerometerStream = accelerometerEvents.listen((AccelerometerEvent event) {
-      if (_isDriving && event.z.abs() > 15) { // Harsh brake/accel
-        _deductPoints(5, "Harsh maneuver!");
-      }
+      if (_isDriving && event.z.abs() > 15) _deductPoints(5, "Harsh maneuver!");
     });
   }
 
   Future<void> _fetchSpeedLimit(double lat, double lon) async {
-    // Simple OpenStreetMap API call for speed limit (mock for demo)
+    // Same OSM mock
     try {
       final response = await http.get(Uri.parse(
-        'https://overpass-api.de/api/interpreter?data=[out:json];way(around:10,$lat,$lon)[highway];out;'
+        'https://overpass-api.de/api/interpreter?data=[out:json];way(around:10,$lat,$lon)[highway];out;',
       ));
       if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        // Mock parsing - in real: extract maxspeed tag
-        setState(() => _speedLimit = 25.0 + Random().nextDouble() * 5); // Demo variation
+        setState(() => _speedLimit = 25.0 + Random().nextDouble() * 5);
       }
     } catch (e) {
       _speedLimit = 25.0;
@@ -102,38 +102,47 @@ class _DriveWiseAppState extends State<DriveWiseApp> {
   }
 
   void _checkTripState() {
-    if (_currentSpeed > 10 && !_isDriving) {
-      _startTrip();
-    } else if (_currentSpeed < 2 && _isDriving) {
-      _endTrip();
-    }
+    if (_currentSpeed > 10 && !_isDriving) _startTrip();
+    else if (_currentSpeed < 2 && _isDriving) _endTrip();
   }
 
   void _startTrip() {
     setState(() => _isDriving = true);
     _speak("Trip started. Drive safe!");
-    _score = 100; // Reset score per trip
+    _score = 100;
   }
 
   Future<void> _endTrip() async {
     setState(() => _isDriving = false);
-    _totalPoints += _score ~/ 2; // Earn half score as points
-    await FirebaseFirestore.instance.collection('trips').add({
-      'score': _score,
-      'points_earned': _score ~/ 2,
-      'timestamp': FieldValue.serverTimestamp(),
-      'userId': 'demo_user', // Add auth later
-    });
-    _speak("Trip ended! Score: $_score out of 100. Earned ${_score ~/ 2} points.");
+    _totalPoints += _score ~/ 2;
+    await _saveTripToCosmos(_score, _score ~/ 2);  // Azure Cosmos call
+    _speak("Trip ended! Score: $_score/100. Earned ${_score ~/ 2} points.");
     _showLeaderboard();
   }
 
+  Future<void> _saveTripToCosmos(int score, int points) async {
+    // Simple REST insert (use azure_cosmos for full SDK)
+    final body = json.encode({
+      'id': DateTime.now().millisecondsSinceEpoch.toString(),
+      'score': score,
+      'pointsEarned': points,
+      'timestamp': DateTime.now().toIso8601String(),
+      'userId': 'demo_user',  // From auth token
+    });
+    final response = await http.post(
+      Uri.parse('$_cosmosEndpointdbs/drivewisedb/colls/trips/docs'),
+      headers: {
+        'Authorization': 'type=aad&ver=1.0&sig=...' ,  // Use your Cosmos key or token
+        'Content-Type': 'application/json',
+      },
+      body: body,
+    );
+    if (response.statusCode != 201) print('Cosmos Error: ${response.body}');
+  }
+
   void _updateScore() {
-    if (_currentSpeed > _speedLimit + 3) {
-      _deductPoints(2, "Speeding! Limit is $_speedLimit mph");
-    } else {
-      _addPoints(1, "Smooth driving!");
-    }
+    if (_currentSpeed > _speedLimit + 3) _deductPoints(2, "Speeding! Limit $_speedLimit mph");
+    else _addPoints(1, "Smooth driving!");
   }
 
   void _addPoints(int pts, String reason) {
@@ -154,73 +163,39 @@ class _DriveWiseAppState extends State<DriveWiseApp> {
   }
 
   void _showLeaderboard() {
-    // Navigate to leaderboard screen (simple modal for now)
+    // Mock for now; query Cosmos in full
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text("Leaderboard"),
-        content: const Text("You: #1 (Demo)\nFriend1: 92\nFriend2: 88"), // Real Firebase later
+        title: const Text("Leaderboard (Azure Cosmos)"),
+        content: const Text("You: #1\nFriend1: 92\nFriend2: 88"),
         actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text("OK"))],
-      ),
-    );
-  }
-
-  void _showPerks() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text("Perks - Total Points: $_totalPoints"),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (_totalPoints >= 500) const ListTile(title: Text("Free Coffee Unlocked!"), subtitle: Text("Scan QR below")),
-            // Add QrImage(qrData: "perk:coffee") here in full version
-          ],
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Redeem")),
-        ],
       ),
     );
   }
 
   @override Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'DriveWise',
-      theme: ThemeData(primarySwatch: Colors.green),
+      title: 'DriveWise Azure',
+      theme: ThemeData(primarySwatch: Colors.blue),  // Azure blue!
       home: Scaffold(
-        appBar: AppBar(
-          title: const Text('DRIVEWISE'),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.star),
-              onPressed: _showPerks,
-            ),
-          ],
-        ),
+        appBar: AppBar(title: const Text('DRIVEWISE'), actions: [IconButton(icon: const Icon(Icons.star), onPressed: _showLeaderboard)]),
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(20.0),
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Text(
-                  _isDriving ? '🚗 DRIVING MODE' : 'Ready to Drive',
-                  style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: _isDriving ? Colors.green : Colors.grey),
-                ),
+                Text(_isDriving ? '🚗 DRIVING MODE' : 'Ready to Drive', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: _isDriving ? Colors.green : Colors.grey)),
                 const SizedBox(height: 20),
-                Text('Speed: ${_currentSpeed.toStringAsFixed(1)} mph', style: const TextStyle(fontSize: 18)),
-                Text('Limit: ${_speedLimit.toStringAsFixed(0)} mph', style: const TextStyle(fontSize: 18)),
+                Text('Speed: ${_currentSpeed.toStringAsFixed(1)} mph', style: const TextSize(18)),
+                Text('Limit: ${_speedLimit.toStringAsFixed(0)} mph', style: const TextSize(18)),
                 const SizedBox(height: 20),
                 Text('Trip Score: $_score / 100', style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold)),
                 Text('Total Points: $_totalPoints', style: const TextStyle(fontSize: 24)),
-                const SizedBox(height: 20),
                 if (_isDriving) Text('Stay under ${_speedLimit.toStringAsFixed(0)} mph!', style: const TextStyle(color: Colors.orange, fontSize: 16)),
                 const SizedBox(height: 40),
-                ElevatedButton(
-                  onPressed: _showLeaderboard,
-                  child: const Text('View Leaderboard'),
-                ),
+                ElevatedButton(onPressed: _showLeaderboard, child: const Text('View Leaderboard')),
               ],
             ),
           ),
